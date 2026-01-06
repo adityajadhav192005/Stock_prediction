@@ -1,9 +1,8 @@
-import React, { use, useEffect, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import axiosInstance from '../../axiosInstance'
 import ComparisonChart from '../../ComparisonChart'
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
 import { faSpinner } from '@fortawesome/free-solid-svg-icons'
-import axios from 'axios'
 
 const Dashboard = () => {
     const [data, setData] = useState('')
@@ -88,6 +87,10 @@ const Dashboard = () => {
                     <div className="form-check form-check-inline">
                         <input className="form-check-input" type="radio" name="modeOptions" id="modeDemo" value="demo" checked={mode==='demo'} onChange={(e)=>setMode(e.target.value)} />
                         <label className="form-check-label" htmlFor="modeDemo">Demo</label>
+                    </div>
+                    <div className="form-check form-check-inline">
+                        <input className="form-check-input" type="radio" name="modeOptions" id="modeCached" value="cached" checked={mode==='cached'} onChange={(e)=>setMode(e.target.value)} />
+                        <label className="form-check-label" htmlFor="modeCached">Cached</label>
                     </div>
                 </div>
                 {!loading ? (<button type='submit' className='btn btn-info'>See Prediction</button>) : (<button type='submit' className='btn btn-info' disabled><FontAwesomeIcon icon={faSpinner} spin/>Please wait...</button>)}
