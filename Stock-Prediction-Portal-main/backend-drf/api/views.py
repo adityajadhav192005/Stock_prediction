@@ -1,4 +1,3 @@
-from django.shortcuts import render
 from rest_framework.views import APIView
 from .serializers import StockPredictionSerializer
 from rest_framework.response import Response
@@ -17,6 +16,8 @@ import time
 from io import StringIO
 import traceback
 from django.http import HttpResponse
+from django.conf import settings
+from django.core.cache import cache
 
 
 # Create your views here.
@@ -31,33 +32,33 @@ class StockPredictionAPIView(APIView):
             ticker = serializer.validated_data['ticker']
             mode = serializer.validated_data.get('mode', 'live')
 
-            # Prepare a base directory & cache directory for fetched CSVs
-            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-            cache_dir = os.path.join(base_dir, 'cache')
-            os.makedirs(cache_dir, exist_ok=True)
+            # Prepare cache directory (file-based cache backend) for fetched data
+            cache_location = settings.CACHES.get("default", {}).get("LOCATION")
+            if cache_location:
+                os.makedirs(str(cache_location), exist_ok=True)
 
-            # Fetch data from yFinance with fallbacks (yfinance -> Ticker.history -> direct Yahoo CSV)
-            # with a simple file cache to reduce repeated remote requests and avoid rate limits.
-            def _cache_path(symbol):
-                return os.path.join(cache_dir, f'{symbol}.csv')
+            def _cache_key(symbol, start_dt, end_dt):
+                return f"stock-data:{symbol}:{start_dt.date()}:{end_dt.date()}"
 
-            def _load_cache(symbol, max_age_seconds=3600):
-                p = _cache_path(symbol)
-                if os.path.exists(p):
-                    age = time.time() - os.path.getmtime(p)
-                    if age <= max_age_seconds:
-                        try:
-                            df_cached = pd.read_csv(p, parse_dates=['Date'], index_col='Date')
-                            if not df_cached.empty:
-                                return df_cached
-                        except Exception:
-                            return None
+            def _load_cache(cache_key):
+                cached = cache.get(cache_key)
+                if not cached:
+                    return None
+                try:
+                    df_cached = pd.read_json(StringIO(cached), orient="split")
+                    if "Date" in df_cached.columns:
+                        df_cached["Date"] = pd.to_datetime(df_cached["Date"])
+                        df_cached = df_cached.set_index("Date")
+                    if not df_cached.empty:
+                        return df_cached
+                except Exception:
+                    return None
                 return None
 
-            def _save_cache(symbol, csv_text):
+            def _save_cache(cache_key, df):
                 try:
-                    with open(_cache_path(symbol), 'w', encoding='utf-8') as fh:
-                        fh.write(csv_text)
+                    df_reset = df.reset_index()
+                    cache.set(cache_key, df_reset.to_json(orient="split"), timeout=settings.LIVE_DATA_CACHE_TTL)
                 except Exception:
                     pass
 
@@ -77,30 +78,15 @@ class StockPredictionAPIView(APIView):
                                     # AlphaVantage columns differ; ensure 'Close' present
                                     if 'close' in df_av.columns:
                                         df_av = df_av.rename(columns={'close': 'Close'})
-                                    try:
-                                        _save_cache(ticker_symbol, resp.text)
-                                    except Exception:
-                                        pass
                                     return df_av
                             except Exception:
                                 pass
                     except Exception:
                         pass
-                # First, try cached CSV (fresh within 1 hour)
-                cached = _load_cache(ticker_symbol, max_age_seconds=3600)
-                if cached is not None:
-                    return cached
-
                 # 1) Try yf.download
                 try:
                     df_local = yf.download(ticker_symbol, start=start_dt, end=end_dt, progress=False)
                     if not df_local.empty:
-                        try:
-                            # persist downloaded CSV for future use
-                            csv_text = df_local.reset_index().to_csv(index=False)
-                            _save_cache(ticker_symbol, csv_text)
-                        except Exception:
-                            pass
                         return df_local
                 except Exception:
                     pass
@@ -110,11 +96,6 @@ class StockPredictionAPIView(APIView):
                     tk = yf.Ticker(ticker_symbol)
                     df_local = tk.history(start=start_dt, end=end_dt)
                     if not df_local.empty:
-                        try:
-                            csv_text = df_local.reset_index().to_csv(index=False)
-                            _save_cache(ticker_symbol, csv_text)
-                        except Exception:
-                            pass
                         return df_local
                 except Exception:
                     pass
@@ -136,10 +117,6 @@ class StockPredictionAPIView(APIView):
                             try:
                                 df_local = pd.read_csv(StringIO(resp.text), parse_dates=['Date'], index_col='Date')
                                 if not df_local.empty:
-                                    try:
-                                        _save_cache(ticker_symbol, resp.text)
-                                    except Exception:
-                                        pass
                                     return df_local
                             except Exception:
                                 pass
@@ -156,6 +133,8 @@ class StockPredictionAPIView(APIView):
             now = datetime.now()
             start = datetime(now.year - 10, now.month, now.day)
             end = now
+
+            cache_key = _cache_key(ticker, start, end)
 
             # Demo mode: force use of bundled Resources CSV (or TSLA.csv)
             if mode == 'demo':
@@ -174,10 +153,21 @@ class StockPredictionAPIView(APIView):
                         continue
                 if df.empty:
                     return Response({'error': 'Demo data not found for the given ticker. Put a CSV in Resources or try a different ticker.'}, status=status.HTTP_404_NOT_FOUND)
+            elif mode == 'cached':
+                df = _load_cache(cache_key)
+                if df is None or df.empty:
+                    return Response(
+                        {'error': 'No cached data found for this ticker. Run Live mode first to populate the cache.'},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
             else:
-                # live mode: try remote providers only; do not fall back to demo CSV automatically
-                df = fetch_stock_data(ticker, start, end)
-                if df.empty:
+                # live mode: cache-first, then remote providers; do not fall back to demo CSV automatically
+                df = _load_cache(cache_key)
+                if df is None or df.empty:
+                    df = fetch_stock_data(ticker, start, end)
+                    if not df.empty:
+                        _save_cache(cache_key, df)
+                if df is None or df.empty:
                     return Response({'error': 'No data found for the given ticker from remote provider. Try demo mode or a different ticker.'}, status=status.HTTP_404_NOT_FOUND)
 
             df = df.reset_index()
